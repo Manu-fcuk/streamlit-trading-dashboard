@@ -328,13 +328,14 @@ def get_data(ticker, period="5d", interval="1m"):
         df = pd.DataFrame(index=temp.index)
         for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
             if col in temp.columns:
-                # Force to standard float64 and take first series if duplicate names
                 series = temp[col]
+                # If it's a dataframe, take the first column
                 if isinstance(series, pd.DataFrame):
                     series = series.iloc[:, 0]
                 df[col] = pd.to_numeric(series, errors='coerce').astype(float)
         
-        # Final cleanup
+        # Deduplicate column names if any and drop NaNs
+        df = df.T.drop_duplicates().T
         df.dropna(subset=['Close'], inplace=True)
         df = df[df['Close'] > 0]
         
@@ -570,14 +571,14 @@ if selected_ticker:
         
         # Stable Table Rendering (Bypass Arrow)
         with st.expander("Debug Raw Data"):
-            # Converting to a simple dictionary or list of lists is safest for st.table
+            # Stable Table Rendering (Bypass Arrow and LargeUtf8)
+            # Converting to records (list of dicts) is the most compatible way for st.table
             debug_df = df.tail(10)[['Close', 'RSI', 'Signal_Point']].copy()
-            st.table(debug_df.astype(str))
+            st.table(debug_df.astype(str).to_dict('records'))
     else:
-        st.error("Data source unavailable. The market might be closed or the interval is invalid for this index.")
+        st.error("Data source unavailable.")
 
-# Auto-Refresh
+# Auto-Refresh (Compatible with older versions)
 if auto_refresh:
     time.sleep(30)
-    try: st.rerun()
-    except: st.experimental_rerun()
+    st.experimental_rerun()
