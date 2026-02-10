@@ -308,7 +308,219 @@ timeframe = st.sidebar.selectbox("Select Timeframe:", ["1m", "5m", "15m", "1h", 
 
 auto_refresh = st.sidebar.checkbox("Auto Refresh (30s)", value=True)
 
-# Strategy Description Helper
+# 2. Fetch Data Function
+def get_data(ticker, period="5d", interval="1m"):
+    try:
+        # We use a very clean download approach
+        temp = yf.download(ticker, period=period, interval=interval, progress=False, prepost=True, auto_adjust=True)
+        if temp.empty: return None
+
+        # Flatten any MultiIndex immediately and explicitly
+        if isinstance(temp.columns, pd.MultiIndex):
+            # Typically (Price, Ticker) or (Ticker, Price)
+            # Find the index of the level that says 'Close'
+            for i in range(temp.columns.nlevels):
+                if 'Close' in temp.columns.get_level_values(i):
+                    temp.columns = temp.columns.get_level_values(i)
+                    break
+        
+        # Select only core columns to start fresh
+        df = pd.DataFrame(index=temp.index)
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            if col in temp.columns:
+                # Force to standard float64 and take first series if duplicate names
+                series = temp[col]
+                if isinstance(series, pd.DataFrame):
+                    series = series.iloc[:, 0]
+                df[col] = pd.to_numeric(series, errors='coerce').astype(float)
+        
+        # Final cleanup
+        df.dropna(subset=['Close'], inplace=True)
+        df = df[df['Close'] > 0]
+        
+        return df
+    except Exception:
+        return None
+
+# 3. Strategy Calculation
+def calculate_indicators(df):
+    if df is None or len(df) == 0: return df
+    df = df.copy()
+
+    # technical indicators (strictly as floats)
+    try:
+        df['RSI'] = ta.rsi(df['Close'], length=14).astype(float)
+        
+        # MACD
+        macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
+        if macd is not None:
+            # Rename columns to standard names
+            for col in macd.columns:
+                if 'MACD_' in col and 'h' not in col and 's' not in col: df['MACD'] = macd[col].astype(float)
+                if 'MACDs_' in col: df['MACD_Signal'] = macd[col].astype(float)
+                if 'MACDh_' in col: df['MACD_Hist'] = macd[col].astype(float)
+
+        # EMAs
+        df['EMA_9'] = ta.ema(df['Close'], length=9).astype(float)
+        df['EMA_21'] = ta.ema(df['Close'], length=21).astype(float)
+        df['EMA_50'] = ta.ema(df['Close'], length=50).astype(float)
+        df['EMA_200'] = ta.ema(df['Close'], length=200).astype(float)
+        
+        # Bollinger
+        bb = ta.bbands(df['Close'], length=20, std=2)
+        if bb is not None:
+            for col in bb.columns:
+                if col.startswith('BBL'): df['BB_Lower'] = bb[col].astype(float)
+                if col.startswith('BBU'): df['BB_Upper'] = bb[col].astype(float)
+    except:
+        pass
+
+    return df
+
+def apply_strategy(df, strategy_name):
+    if df is None or len(df) < 5: return df
+    df['Signal_Point'] = 0.0
+    
+    # Use fillna(0) locally for indicator logic ONLY to prevent breaks
+    # but don't fill the price columns
+    
+    # 1. Momentum
+    if "Momentum" in strategy_name and 'MACD' in df.columns:
+        m = df['MACD'].fillna(0)
+        s = df['MACD_Signal'].fillna(0)
+        cross_up = (m.shift(1) <= s.shift(1)) & (m > s)
+        cross_down = (m.shift(1) >= s.shift(1)) & (m < s)
+        
+        if 'EMA_200' in df.columns:
+            ema200 = df['EMA_200'].fillna(method='ffill')
+            uptrend = df['Close'] > ema200
+            downtrend = df['Close'] < ema200
+            df.loc[uptrend & cross_up & (df['RSI'].fillna(50) < 70), 'Signal_Point'] = 1.0
+            df.loc[downtrend & cross_down & (df['RSI'].fillna(50) > 30), 'Signal_Point'] = -1.0
+            
+    # 2. Mean Reversion
+    elif "Mean Reversion" in strategy_name and 'BB_Lower' in df.columns:
+        buy_cond = (df['Close'] < df['BB_Lower']) & (df['RSI'].fillna(50) < 35)
+        sell_cond = (df['Close'] > df['BB_Upper']) & (df['RSI'].fillna(50) > 65)
+        df.loc[buy_cond, 'Signal_Point'] = 1.0
+        df.loc[sell_cond, 'Signal_Point'] = -1.0
+        
+    # 3. Scalping
+    elif "Scalping" in strategy_name and 'EMA_9' in df.columns:
+        e9 = df['EMA_9'].fillna(0)
+        e21 = df['EMA_21'].fillna(0)
+        cross_up = (e9.shift(1) <= e21.shift(1)) & (e9 > e21)
+        cross_down = (e9.shift(1) >= e21.shift(1)) & (e9 < e21)
+        df.loc[cross_up, 'Signal_Point'] = 1.0
+        df.loc[cross_down, 'Signal_Point'] = -1.0
+
+    # 4. ORB
+    elif "ORB" in strategy_name:
+        df['Date_Str'] = df.index.date
+        for date, day_data in df.groupby('Date_Str'):
+            if len(day_data) < 30: continue
+            opening_range = day_data.iloc[:30]
+            oh = float(opening_range['High'].max())
+            ol = float(opening_range['Low'].min())
+            cutoff = day_data.index[29]
+            mask = (df.index.date == date) & (df.index > cutoff)
+            bu = mask & (df['Close'] > oh) & (df['Close'].shift(1) <= oh)
+            bd = mask & (df['Close'] < ol) & (df['Close'].shift(1) >= ol)
+            df.loc[bu, 'Signal_Point'] = 1.0
+            df.loc[bd, 'Signal_Point'] = -1.0
+            df.loc[df.index.date == date, 'ORB_High'] = oh
+            df.loc[df.index.date == date, 'ORB_Low'] = ol
+            
+    return df
+
+def generate_current_signal(df):
+    if df is None or 'Signal_Point' not in df.columns:
+        return "NEUTRAL", "No indicators"
+    
+    recent_signals = df[df['Signal_Point'] != 0.0].tail(1)
+    if recent_signals.empty:
+        return "NEUTRAL", "No signals in loaded history"
+    
+    val = recent_signals['Signal_Point'].values[0]
+    time = recent_signals.index[0]
+    return ("BUY" if val > 0 else "SELL"), f"Triggered at {time.strftime('%H:%M')}"
+
+# 4. Visualization
+def plot_chart(df, ticker_name, strategy_name, timeframe):
+    if df is None or len(df) < 2: return
+
+    # Filter for session
+    if timeframe in ["1m", "5m"]:
+        last_date = df.index[-1].date()
+        df_p = df[df.index.date == last_date].copy()
+    else:
+        df_p = df.tail(300).copy()
+
+    if len(df_p) < 2:
+        st.info("Market session just starting...")
+        return
+
+    # Create subplots
+    rows = 2
+    heights = [0.7, 0.3]
+    titles = ("Price Action", "RSI")
+    if "Momentum" in strategy_name:
+        rows = 3
+        heights = [0.6, 0.2, 0.2]
+        titles = ("Price Action", "RSI", "MACD")
+    
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=heights, subplot_titles=titles)
+
+    # 1. Price candles
+    fig.add_trace(go.Candlestick(
+        x=df_p.index, open=df_p['Open'], high=df_p['High'],
+        low=df_p['Low'], close=df_p['Close'], name='Market'
+    ), row=1, col=1)
+
+    # Overlays (Strictly on Price row)
+    if "Momentum" in strategy_name and 'EMA_200' in df_p.columns:
+        # Prevent zero-pollution: filter NaNs
+        clean_ema = df_p['EMA_200'].dropna()
+        if not clean_ema.empty:
+            fig.add_trace(go.Scatter(x=clean_ema.index, y=clean_ema.values, name='EMA 200', line=dict(color='blue', width=1.5)), row=1, col=1)
+            
+    elif "Mean Reversion" in strategy_name and 'BB_Upper' in df_p.columns:
+        fig.add_trace(go.Scatter(x=df_p.index, y=df_p['BB_Upper'], name='Upper BB', line=dict(color='rgba(173,216,230,0.5)', width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_p.index, y=df_p['BB_Lower'], name='Lower BB', line=dict(color='rgba(173,216,230,0.5)', width=1)), row=1, col=1)
+        
+    elif "Scalping" in strategy_name and 'EMA_9' in df_p.columns:
+        fig.add_trace(go.Scatter(x=df_p.index, y=df_p['EMA_9'], name='EMA 9', line=dict(color='green', width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_p.index, y=df_p['EMA_21'], name='EMA 21', line=dict(color='red', width=1)), row=1, col=1)
+
+    elif "ORB" in strategy_name and 'ORB_High' in df_p.columns:
+        fig.add_trace(go.Scatter(x=df_p.index, y=df_p['ORB_High'], name='ORB High', line=dict(color='orange', width=1, dash='dash')), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_p.index, y=df_p['ORB_Low'], name='ORB Low', line=dict(color='orange', width=1, dash='dash')), row=1, col=1)
+
+    # Signals
+    buys = df_p[df_p['Signal_Point'] == 1.0]
+    sells = df_p[df_p['Signal_Point'] == -1.0]
+    if not buys.empty:
+        fig.add_trace(go.Scatter(x=buys.index, y=buys['Low']*0.9997, mode='markers', marker=dict(symbol='triangle-up', size=14, color='#00ff00'), name='BUY'), row=1, col=1)
+    if not sells.empty:
+        fig.add_trace(go.Scatter(x=sells.index, y=sells['High']*1.0003, mode='markers', marker=dict(symbol='triangle-down', size=14, color='#ff0000'), name='SELL'), row=1, col=1)
+
+    # 2. RSI
+    if 'RSI' in df_p.columns:
+        fig.add_trace(go.Scatter(x=df_p.index, y=df_p['RSI'], name='RSI', line=dict(color='purple')), row=2, col=1)
+        fig.add_hline(y=70, line=dict(color="red", width=1, dash="dash"), row=2, col=1)
+        fig.add_hline(y=30, line=dict(color="green", width=1, dash="dash"), row=2, col=1)
+        fig.update_yaxes(range=[0, 100], row=2, col=1)
+
+    # 3. MACD
+    if "Momentum" in strategy_name and 'MACD' in df_p.columns:
+        fig.add_trace(go.Bar(x=df_p.index, y=df_p['MACD_Hist'], name='Hist', marker_color='#888888'), row=3, col=1)
+        fig.add_trace(go.Scatter(x=df_p.index, y=df_p['MACD'], name='MACD', line=dict(color='blue', width=1)), row=3, col=1)
+        fig.add_trace(go.Scatter(x=df_p.index, y=df_p['MACD_Signal'], name='Signal', line=dict(color='orange', width=1)), row=3, col=1)
+
+    fig.update_layout(height=800, xaxis_rangeslider_visible=False, template="plotly_dark", margin=dict(l=10, r=10, t=30, b=10), showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+# Main Logic for Selected Index
 strategy_info = {
     "Momentum (EMA + MACD + RSI)": "Best for **Trending Markets**. Buys when price is above EMA 200 and MACD crosses up. Sells when price is below EMA 200 and MACD crosses down.",
     "Mean Reversion (Bollinger + RSI)": "Best for **Ranging/Sideways Markets**. Buys when price touches Lower Bollinger Band (Oversold). Sells when price touches Upper Band (Overbought).",
@@ -333,253 +545,39 @@ yf_interval = timeframe
 if timeframe == "4h":
     yf_interval = "1h" 
 
-# 2. Fetch Data Function
-def get_data(ticker, period="5d", interval="1m"):
-    try:
-        data = yf.download(ticker, period=period, interval=interval, progress=False, prepost=True, auto_adjust=True)
-        if data.empty: return None
-            
-        # Standardize MultiIndex if present
-        if isinstance(data.columns, pd.MultiIndex):
-            for i in range(data.columns.nlevels):
-                if 'Close' in data.columns.get_level_values(i):
-                    data.columns = data.columns.get_level_values(i)
-                    break
-        
-        # We need these columns
-        needed = ['Open', 'High', 'Low', 'Close']
-        if not all(c in data.columns for c in needed):
-            return None
-            
-        # Convert to standard numpy floats and clean
-        df = data[needed].copy()
-        for c in needed:
-            df[c] = pd.to_numeric(df[c], errors='coerce').astype(float)
-        
-        # Filter out extreme anomalies/zeros
-        df = df[df['Close'] > 0]
-        df.dropna(inplace=True)
-        
-        return df
-    except Exception:
-        return None
-
-# 3. Strategy Calculation
-def calculate_indicators(df):
-    if df is None or len(df) < 5: return df
-    df = df.copy()
-
-    # Technical indicators from pandas_ta
-    df['RSI'] = ta.rsi(df['Close'], length=14)
-    
-    # EMAs
-    df['EMA_9'] = ta.ema(df['Close'], length=9)
-    df['EMA_21'] = ta.ema(df['Close'], length=21)
-    df['EMA_50'] = ta.ema(df['Close'], length=50)
-    df['EMA_200'] = ta.ema(df['Close'], length=200)
-    
-    # MACD
-    macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
-    if macd is not None:
-        # Align by index to be safe
-        df = pd.concat([df, macd], axis=1)
-        # Rename standardly
-        m_col = [c for c in df.columns if 'MACD_' in str(c) and 'h' not in str(c) and 's' not in str(c)]
-        s_col = [c for c in df.columns if 'MACDs_' in str(c)]
-        h_col = [c for c in df.columns if 'MACDh_' in str(c)]
-        if m_col: df.rename(columns={m_col[0]: 'MACD'}, inplace=True)
-        if s_col: df.rename(columns={s_col[0]: 'MACD_Signal'}, inplace=True)
-        if h_col: df.rename(columns={h_col[0]: 'MACD_Hist'}, inplace=True)
-
-    # Bollinger
-    bb = ta.bbands(df['Close'], length=20, std=2)
-    if bb is not None:
-        df = pd.concat([df, bb], axis=1)
-        l_col = [c for c in df.columns if c.startswith('BBL')]
-        u_col = [c for c in df.columns if c.startswith('BBU')]
-        if l_col: df.rename(columns={l_col[0]: 'BB_Lower'}, inplace=True)
-        if u_col: df.rename(columns={u_col[0]: 'BB_Upper'}, inplace=True)
-
-    return df
-
-def apply_strategy(df, strategy_name):
-    if df is None or len(df) < 5: return df
-    df['Signal_Point'] = 0.0
-    
-    # Momentum
-    if "Momentum" in strategy_name and 'MACD' in df.columns:
-        cross_up = (df['MACD'].shift(1) <= df['MACD_Signal'].shift(1)) & (df['MACD'] > df['MACD_Signal'])
-        cross_down = (df['MACD'].shift(1) >= df['MACD_Signal'].shift(1)) & (df['MACD'] < df['MACD_Signal'])
-        # Filter trend
-        if 'EMA_200' in df.columns:
-            uptrend = df['Close'] > df['EMA_200']
-            downtrend = df['Close'] < df['EMA_200']
-            df.loc[uptrend & cross_up & (df['RSI'] < 70), 'Signal_Point'] = 1.0
-            df.loc[downtrend & cross_down & (df['RSI'] > 30), 'Signal_Point'] = -1.0
-            
-    # Mean Reversion
-    elif "Mean Reversion" in strategy_name and 'BB_Lower' in df.columns:
-        buy_cond = (df['Close'] < df['BB_Lower']) & (df['RSI'] < 35)
-        sell_cond = (df['Close'] > df['BB_Upper']) & (df['RSI'] > 65)
-        df.loc[buy_cond, 'Signal_Point'] = 1.0
-        df.loc[sell_cond, 'Signal_Point'] = -1.0
-        
-    # Scalping
-    elif "Scalping" in strategy_name and 'EMA_9' in df.columns:
-        cross_up = (df['EMA_9'].shift(1) <= df['EMA_21'].shift(1)) & (df['EMA_9'] > df['EMA_21'])
-        cross_down = (df['EMA_9'].shift(1) >= df['EMA_21'].shift(1)) & (df['EMA_9'] < df['EMA_21'])
-        df.loc[cross_up, 'Signal_Point'] = 1.0
-        df.loc[cross_down, 'Signal_Point'] = -1.0
-
-    # ORB
-    elif "ORB" in strategy_name:
-        df['Date_Str'] = df.index.date
-        for date, day_data in df.groupby('Date_Str'):
-            if len(day_data) < 30: continue
-            opening_range = day_data.iloc[:30]
-            oh = float(opening_range['High'].max())
-            ol = float(opening_range['Low'].min())
-            cutoff = day_data.index[29]
-            mask = (df.index.date == date) & (df.index > cutoff)
-            bu = mask & (df['Close'] > oh) & (df['Close'].shift(1) <= oh)
-            bd = mask & (df['Close'] < ol) & (df['Close'].shift(1) >= ol)
-            df.loc[bu, 'Signal_Point'] = 1.0
-            df.loc[bd, 'Signal_Point'] = -1.0
-            df.loc[df.index.date == date, 'ORB_High'] = oh
-            df.loc[df.index.date == date, 'ORB_Low'] = ol
-            
-    return df
-
-def generate_current_signal(df):
-    if df is None or 'Signal_Point' not in df.columns:
-        return "NEUTRAL", "No data"
-    
-    signals = df[df['Signal_Point'] != 0].tail(1)
-    if signals.empty:
-        return "NEUTRAL", "Waiting for trigger..."
-    
-    val = signals['Signal_Point'].values[0]
-    idx = signals.index[0]
-    return ("BUY" if val > 0 else "SELL"), f"Triggered at {idx.strftime('%H:%M')}"
-
-# 4. Visualization
-def plot_chart(df, ticker_name, strategy_name, timeframe):
-    if df is None or len(df) == 0: 
-        st.warning("No data to plot.")
-        return
-
-    # Filter view
-    if timeframe in ["1m", "5m"]:
-        last_date = df.index[-1].date()
-        df_plot = df[df.index.date == last_date].copy()
-    else:
-        df_plot = df.tail(300).copy()
-
-    if len(df_plot) < 2:
-        st.info("Insufficient data for today's session yet.")
-        return
-
-    # Setup Figures
-    rows = 2
-    heights = [0.7, 0.3]
-    titles = (f"{ticker_name} Price", "RSI")
-    
-    if "Momentum" in strategy_name:
-        rows = 3
-        heights = [0.6, 0.2, 0.2]
-        titles = (f"{ticker_name} Price", "RSI", "MACD")
-    
-    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=heights, subplot_titles=titles)
-
-    # 1. Candlesticks
-    fig.add_trace(go.Candlestick(
-        x=df_plot.index,
-        open=df_plot['Open'], high=df_plot['High'], 
-        low=df_plot['Low'], close=df_plot['Close'],
-        name='Candles'
-    ), row=1, col=1)
-
-    # Indicators Overlays
-    if "Momentum" in strategy_name and 'EMA_200' in df_plot.columns:
-        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['EMA_200'], line=dict(color='blue', width=1), name='EMA 200'), row=1, col=1)
-    elif "Mean Reversion" in strategy_name and 'BB_Upper' in df_plot.columns:
-        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['BB_Upper'], line=dict(color='rgba(173,216,230,0.5)', width=1), name='BB Upper'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['BB_Lower'], line=dict(color='rgba(173,216,230,0.5)', width=1), name='BB Lower'), row=1, col=1)
-    elif "Scalping" in strategy_name and 'EMA_9' in df_plot.columns:
-        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['EMA_9'], line=dict(color='green', width=1), name='EMA 9'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['EMA_21'], line=dict(color='red', width=1), name='EMA 21'), row=1, col=1)
-    elif "ORB" in strategy_name and 'ORB_High' in df_plot.columns:
-        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['ORB_High'], line=dict(color='orange', width=1, dash='dash'), name='ORB High'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['ORB_Low'], line=dict(color='orange', width=1, dash='dash'), name='ORB Low'), row=1, col=1)
-
-    # Signals
-    buys = df_plot[df_plot['Signal_Point'] == 1.0]
-    sells = df_plot[df_plot['Signal_Point'] == -1.0]
-    if not buys.empty:
-        fig.add_trace(go.Scatter(x=buys.index, y=buys['Low']*0.9995, mode='markers', marker=dict(symbol='triangle-up', size=15, color='#00ff00'), name='BUY'), row=1, col=1)
-    if not sells.empty:
-        fig.add_trace(go.Scatter(x=sells.index, y=sells['High']*1.0005, mode='markers', marker=dict(symbol='triangle-down', size=15, color='#ff0000'), name='SELL'), row=1, col=1)
-
-    # 2. RSI
-    if 'RSI' in df_plot.columns:
-        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['RSI'], line=dict(color='purple', width=2), name='RSI'), row=2, col=1)
-        fig.add_hline(y=70, line=dict(color="red", width=1, dash="dash"), row=2, col=1)
-        fig.add_hline(y=30, line=dict(color="green", width=1, dash="dash"), row=2, col=1)
-        fig.update_yaxes(range=[0, 100], row=2, col=1)
-
-    # 3. MACD
-    if "Momentum" in strategy_name and 'MACD' in df_plot.columns:
-        colors = ['green' if v >= 0 else 'red' for v in df_plot['MACD_Hist'].fillna(0)]
-        fig.add_trace(go.Bar(x=df_plot.index, y=df_plot['MACD_Hist'], marker_color=colors, name='MACD Hist'), row=3, col=1)
-        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MACD'], line=dict(color='blue', width=1), name='MACD'), row=3, col=1)
-        fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MACD_Signal'], line=dict(color='orange', width=1), name='Signal'), row=3, col=1)
-
-    fig.update_layout(height=800, xaxis_rangeslider_visible=False, template="plotly_dark", margin=dict(l=10, r=10, t=30, b=10), showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
-
-# Main Logic for Selected Index
+# Main Logic
 if selected_ticker:
-    with st.spinner(f"Updating {selected_index_name}..."):
+    with st.spinner(f"Loading {selected_index_name}..."):
         df = get_data(selected_ticker, period=fetch_period, interval=yf_interval)
 
     if df is not None:
-        # Handle 4H resampling
         if timeframe == "4h":
-            agg = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
-            df = df.resample('4h').agg(agg).dropna()
+            df = df.resample('4H').agg({'Open':'first','High':'max','Low':'min','Close':'last'}).dropna()
 
-        # Indicators & Strategy
         df = calculate_indicators(df)
         df = apply_strategy(df, strategy_type)
         
-        # Display Header
-        signal, reason = generate_current_signal(df)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Last Price", f"{df['Close'].iloc[-1]:.2f}")
+        # Dashboard Top
+        sig, res = generate_current_signal(df)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Current Price", f"{df['Close'].iloc[-1]:,.2f}")
+        c = "#00ff00" if sig == "BUY" else "#ff0000" if sig == "SELL" else "#cccccc"
+        m2.markdown(f"**SIGNAL:** <span style='color:{c}; font-size:26px;'>{sig}</span>", unsafe_allow_html=True)
+        m3.info(f"**Logic:** {res}")
         
-        sig_col = "#00ff00" if signal == "BUY" else "#ff0000" if signal == "SELL" else "#888888"
-        c2.markdown(f"**Signal:** <span style='color:{sig_col}; font-size:24px;'>{signal}</span>", unsafe_allow_html=True)
-        c3.write(f"**Reason:** {reason}")
-        
-        # Plot
+        # Analysis
         plot_chart(df, selected_index_name, strategy_type, timeframe)
         
-        # Table (Use st.table for stability)
-        with st.expander("Recent Data Debug"):
-            disp = df.tail(10).copy()
-            # Convert to strings to avoid LargeUtf8 error
-            st.table(disp.astype(str))
+        # Stable Table Rendering (Bypass Arrow)
+        with st.expander("Debug Raw Data"):
+            # Converting to a simple dictionary or list of lists is safest for st.table
+            debug_df = df.tail(10)[['Close', 'RSI', 'Signal_Point']].copy()
+            st.table(debug_df.astype(str))
     else:
-        st.error("Data Fetch Error. Please check ticker or timeframe.")
+        st.error("Data source unavailable. The market might be closed or the interval is invalid for this index.")
 
-# Auto-Refresh Logic (Placed at end to avoid blocking render)
+# Auto-Refresh
 if auto_refresh:
     time.sleep(30)
-    try:
-        st.rerun()
-    except AttributeError:
-        st.experimental_rerun()
-
-
-
-
+    try: st.rerun()
+    except: st.experimental_rerun()
