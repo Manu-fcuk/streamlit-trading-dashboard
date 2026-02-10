@@ -4,5 +4,5 @@ pandas_ta
 streamlit
 yfinance
 plotly
-altair
+altair<5
 numpy
