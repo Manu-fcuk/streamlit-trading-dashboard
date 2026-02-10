@@ -1,9 +1,8 @@
 requests
-pandas<2.2.0
+pandas
 pandas_ta
-streamlit>=1.31.0
+streamlit
 yfinance
 plotly
 altair<5
 numpy
-pyarrow

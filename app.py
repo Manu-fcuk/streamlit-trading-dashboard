@@ -51,110 +51,138 @@ INDICES = {
 # 2. Fetch Data Function
 def get_data(ticker, period="5d", interval="1m"):
     try:
-        # st.write(f"Debug: Downloading {ticker} p={period} i={interval}")
         data = yf.download(ticker, period=period, interval=interval, progress=False, prepost=True, auto_adjust=False)
-        
-        if data.empty:
-            return None
+        if data.empty: return None
             
         # Robust MultiIndex Flattening
-        # yfinance v0.2+ returns MultiIndex columns (Price, Ticker) by default
         if isinstance(data.columns, pd.MultiIndex):
-            # We want to drop the Ticker level
-            try:
-                data.columns = data.columns.droplevel(1)
-            except:
-                pass
-            
-            # If that failed or wasn't enough, try explicit selection
-            if isinstance(data.columns, pd.MultiIndex):
-                if 'Close' in data.columns.get_level_values(0):
-                     data.columns = data.columns.get_level_values(0)
-                elif 'Close' in data.columns.get_level_values(1):
-                     data.columns = data.columns.get_level_values(1)
-            
+            # yf v0.2.x returns (Price, Ticker) or (Ticker, Price)
+            # Find levels that contain 'Close'
+            for i in range(data.columns.nlevels):
+                if 'Close' in data.columns.get_level_values(i):
+                    data.columns = data.columns.get_level_values(i)
+                    break
+        
+        # Ensure standard OHLC columns exist
         required_cols = ['Open', 'High', 'Low', 'Close']
         if not all(col in data.columns for col in required_cols):
-            # st.error(f"Missing columns: {data.columns.tolist()}")
             return None
             
+        # CAST TO NUMERIC IMMEDIATELY
+        for col in required_cols:
+            data[col] = pd.to_numeric(data[col], errors='coerce')
+        
+        data.dropna(subset=required_cols, inplace=True)
         return data
-    except Exception as e:
-        # st.error(f"Ex: {e}")
+    except Exception:
         return None
 
 # 3. Strategy Calculation
 def calculate_indicators(df):
-    if df is None:
-        return df
-    
-    # Copy to avoid SettingWithCopy warnings    
+    if df is None: return df
     df = df.copy()
 
-    # Ensure numerical columns
-    cols = ['Open', 'High', 'Low', 'Close']
-    for c in cols:
+    # Ensure numerical and Drop NaNs in price
+    price_cols = ['Open', 'High', 'Low', 'Close']
+    for c in price_cols:
         df[c] = pd.to_numeric(df[c], errors='coerce')
-        
-    df.dropna(subset=cols, inplace=True)
+    df.dropna(subset=price_cols, inplace=True)
     
-    if len(df) < 50:
-        return df
+    if len(df) < 50: return df
     
+    # --- Technical Indicators ---
     # RSI
     df['RSI'] = ta.rsi(df['Close'], length=14)
     
     # MACD
     macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
     if macd is not None:
-        df = pd.concat([df, macd], axis=1)
-        cols = df.columns
-        try:
-            # Flexible column finding for MACD
-            # pandas_ta columns usually: MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
-            # But sometimes names differ based on version
-            macd_col = [c for c in cols if str(c).startswith('MACD_') and 'h' not in str(c) and 's' not in str(c)][0]
-            signal_col = [c for c in cols if str(c).startswith('MACDs_')][0]
-            hist_col = [c for c in cols if str(c).startswith('MACDh_')][0]
-            
-            df['MACD'] = df[macd_col]
-            df['MACD_Signal'] = df[signal_col]
-            df['MACD_Hist'] = df[hist_col]
-        except IndexError:
-            pass
+        # Standardize MACD column names
+        # MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
+        m_col = [c for c in macd.columns if 'MACD_' in str(c) and 'h' not in str(c) and 's' not in str(c)]
+        s_col = [c for c in macd.columns if 'MACDs_' in str(c)]
+        h_col = [c for c in macd.columns if 'MACDh_' in str(c)]
+        
+        if m_col: df['MACD'] = macd[m_col[0]]
+        if s_col: df['MACD_Signal'] = macd[s_col[0]]
+        if h_col: df['MACD_Hist'] = macd[h_col[0]]
 
-    # Moving Averages
+    # EMAs
+    df['EMA_9'] = ta.ema(df['Close'], length=9)
+    df['EMA_21'] = ta.ema(df['Close'], length=21)
     df['EMA_50'] = ta.ema(df['Close'], length=50)
     df['EMA_200'] = ta.ema(df['Close'], length=200)
     
-    # --- Generate Historical Signals for Plotting ---
-    df['Signal_Point'] = 0 
-    
-    # Shift
-    df['MACD_Prev'] = df['MACD'].shift(1)
-    df['Signal_Prev'] = df['MACD_Signal'].shift(1)
-    
-    # Logic
-    # Fill NA to avoid comparison errors
-    df['MACD'] = df['MACD'].fillna(0)
-    df['MACD_Signal'] = df['MACD_Signal'].fillna(0)
-    df['MACD_Prev'] = df['MACD_Prev'].fillna(0)
-    df['Signal_Prev'] = df['Signal_Prev'].fillna(0)
-    df['EMA_200'] = df['EMA_200'].fillna(0)
-    df['RSI'] = df['RSI'].fillna(50) 
-    
-    bullish_cross = (df['MACD_Prev'] <= df['Signal_Prev']) & (df['MACD'] > df['MACD_Signal'])
-    bearish_cross = (df['MACD_Prev'] >= df['Signal_Prev']) & (df['MACD'] < df['MACD_Signal'])
-    
-    uptrend = df['Close'] > df['EMA_200']
-    downtrend = df['Close'] < df['EMA_200']
-    
-    # Only generate signals where EMA_200 is valid (after 200 bars)
-    valid_data = df['EMA_200'] != 0
-    
-    df.loc[valid_data & uptrend & bullish_cross & (df['RSI'] < 70), 'Signal_Point'] = 1
-    df.loc[valid_data & downtrend & bearish_cross & (df['RSI'] > 30), 'Signal_Point'] = -1
+    # Bollinger Bands
+    bb = ta.bbands(df['Close'], length=20, std=2)
+    if bb is not None:
+        l_col = [c for c in bb.columns if c.startswith('BBL')]
+        u_col = [c for c in bb.columns if c.startswith('BBU')]
+        if l_col: df['BB_Lower'] = bb[l_col[0]]
+        if u_col: df['BB_Upper'] = bb[u_col[0]]
 
+    return df
+
+def apply_strategy(df, strategy_name):
+    if df is None or len(df) < 20: return df
+    
+    df['Signal_Point'] = 0
+    
+    # 1. Momentum Strategy
+    if "Momentum" in strategy_name and 'MACD' in df.columns:
+        m = df['MACD'].fillna(0)
+        s = df['MACD_Signal'].fillna(0)
+        cross_up = (m.shift(1) <= s.shift(1)) & (m > s)
+        cross_down = (m.shift(1) >= s.shift(1)) & (m < s)
+        
+        # Trend filter
+        ema200 = df['EMA_200'].fillna(method='ffill')
+        uptrend = df['Close'] > ema200
+        downtrend = df['Close'] < ema200
+        
+        df.loc[uptrend & cross_up & (df['RSI'] < 70), 'Signal_Point'] = 1
+        df.loc[downtrend & cross_down & (df['RSI'] > 30), 'Signal_Point'] = -1
+        
+    # 2. Mean Reversion
+    elif "Mean Reversion" in strategy_name and 'BB_Lower' in df.columns:
+        buy_cond = (df['Close'] < df['BB_Lower']) & (df['RSI'] < 35)
+        sell_cond = (df['Close'] > df['BB_Upper']) & (df['RSI'] > 65)
+        df.loc[buy_cond, 'Signal_Point'] = 1
+        df.loc[sell_cond, 'Signal_Point'] = -1
+        
+    # 3. Scalping
+    elif "Scalping" in strategy_name and 'EMA_9' in df.columns:
+        e9 = df['EMA_9'].fillna(0)
+        e21 = df['EMA_21'].fillna(0)
+        cross_up = (e9.shift(1) <= e21.shift(1)) & (e9 > e21)
+        cross_down = (e9.shift(1) >= e21.shift(1)) & (e9 < e21)
+        df.loc[cross_up, 'Signal_Point'] = 1
+        df.loc[cross_down, 'Signal_Point'] = -1
+
+    # 4. ORB
+    elif "ORB" in strategy_name:
+        df['Date_Str'] = df.index.date
+        for date, day_data in df.groupby('Date_Str'):
+            # Need enough data for 30m ORB
+            # if 1m, 30 bars. if 5m, 6 bars.
+            needed = 30 # conservative
+            if len(day_data) < needed: continue
+            
+            opening_range = day_data.iloc[:needed]
+            o_high = opening_range['High'].max()
+            o_low = opening_range['Low'].min()
+            
+            mask_day = df['Date_Str'] == date
+            cutoff = day_data.index[needed-1]
+            
+            break_up = (df.index > cutoff) & (mask_day) & (df['Close'] > o_high) & (df['Close'].shift(1) <= o_high)
+            break_down = (df.index > cutoff) & (mask_day) & (df['Close'] < o_low) & (df['Close'].shift(1) >= o_low)
+            
+            df.loc[break_up, 'Signal_Point'] = 1
+            df.loc[break_down, 'Signal_Point'] = -1
+            df.loc[mask_day, 'ORB_High'] = o_high
+            df.loc[mask_day, 'ORB_Low'] = o_low
+            
     return df
 
 def generate_current_signal(df):
@@ -539,7 +567,9 @@ if selected_ticker:
         
         # Recent Data Table
         with st.expander("View Recent Data"):
-            st.dataframe(df.tail(10)[['Open', 'High', 'Low', 'Close', 'RSI', 'Signal_Point']].style.format("{:.2f}"))
+            # Cast to float to avoid LargeUtf8/Arrow errors in some environments
+            display_df = df.tail(10)[['Open', 'High', 'Low', 'Close', 'RSI', 'Signal_Point']].astype(float)
+            st.dataframe(display_df.style.format("{:.2f}"))
 
     else:
         st.error(f"No data found for {selected_index_name} ({selected_ticker}).")
