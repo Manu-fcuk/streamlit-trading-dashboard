@@ -470,6 +470,9 @@ def plot_chart(df, ticker_name, strategy_name, timeframe):
         heights = [0.6, 0.2, 0.2]
         titles = ("Price Action", "RSI", "MACD")
     
+    # Final categorical index conversion to fix Plotly scaling issues
+    df_p.index = df_p.index.strftime('%H:%M')
+    
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=heights, subplot_titles=titles)
 
     # 1. Price candles
@@ -477,22 +480,16 @@ def plot_chart(df, ticker_name, strategy_name, timeframe):
         x=df_p.index, open=df_p['Open'], high=df_p['High'],
         low=df_p['Low'], close=df_p['Close'], name='Market'
     ), row=1, col=1)
-
-    # Overlays (Strictly on Price row)
+    
+    # Overlays
     if "Momentum" in strategy_name and 'EMA_200' in df_p.columns:
-        # Prevent zero-pollution: filter NaNs
-        clean_ema = df_p['EMA_200'].dropna()
-        if not clean_ema.empty:
-            fig.add_trace(go.Scatter(x=clean_ema.index, y=clean_ema.values, name='EMA 200', line=dict(color='blue', width=1.5)), row=1, col=1)
-            
+        fig.add_trace(go.Scatter(x=df_p.index, y=df_p['EMA_200'], name='EMA 200', line=dict(color='blue', width=1.5)), row=1, col=1)
     elif "Mean Reversion" in strategy_name and 'BB_Upper' in df_p.columns:
         fig.add_trace(go.Scatter(x=df_p.index, y=df_p['BB_Upper'], name='Upper BB', line=dict(color='rgba(173,216,230,0.5)', width=1)), row=1, col=1)
         fig.add_trace(go.Scatter(x=df_p.index, y=df_p['BB_Lower'], name='Lower BB', line=dict(color='rgba(173,216,230,0.5)', width=1)), row=1, col=1)
-        
     elif "Scalping" in strategy_name and 'EMA_9' in df_p.columns:
         fig.add_trace(go.Scatter(x=df_p.index, y=df_p['EMA_9'], name='EMA 9', line=dict(color='green', width=1)), row=1, col=1)
         fig.add_trace(go.Scatter(x=df_p.index, y=df_p['EMA_21'], name='EMA 21', line=dict(color='red', width=1)), row=1, col=1)
-
     elif "ORB" in strategy_name and 'ORB_High' in df_p.columns:
         fig.add_trace(go.Scatter(x=df_p.index, y=df_p['ORB_High'], name='ORB High', line=dict(color='orange', width=1, dash='dash')), row=1, col=1)
         fig.add_trace(go.Scatter(x=df_p.index, y=df_p['ORB_Low'], name='ORB Low', line=dict(color='orange', width=1, dash='dash')), row=1, col=1)
@@ -519,6 +516,8 @@ def plot_chart(df, ticker_name, strategy_name, timeframe):
         fig.add_trace(go.Scatter(x=df_p.index, y=df_p['MACD_Signal'], name='Signal', line=dict(color='orange', width=1)), row=3, col=1)
 
     fig.update_layout(height=800, xaxis_rangeslider_visible=False, template="plotly_dark", margin=dict(l=10, r=10, t=30, b=10), showlegend=False)
+    # Force categorical axis
+    fig.update_xaxes(type='category')
     st.plotly_chart(fig, use_container_width=True)
 
 # Main Logic for Selected Index
@@ -569,12 +568,10 @@ if selected_ticker:
         # Analysis
         plot_chart(df, selected_index_name, strategy_type, timeframe)
         
-        # Stable Table Rendering (Bypass Arrow)
+        # HTML Table Rendering (Bypasses Arrow completely)
         with st.expander("Debug Raw Data"):
-            # Stable Table Rendering (Bypass Arrow and LargeUtf8)
-            # Converting to records (list of dicts) is the most compatible way for st.table
             debug_df = df.tail(10)[['Close', 'RSI', 'Signal_Point']].copy()
-            st.table(debug_df.astype(str).to_dict('records'))
+            st.write(debug_df.to_html(classes='table table-dark table-striped'), unsafe_allow_html=True)
     else:
         st.error("Data source unavailable.")
 
