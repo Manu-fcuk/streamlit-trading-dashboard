@@ -51,61 +51,62 @@ INDICES = {
 # 2. Fetch Data Function
 def get_data(ticker, period="5d", interval="1m"):
     try:
+        # Download data
         data = yf.download(ticker, period=period, interval=interval, progress=False, prepost=True, auto_adjust=False)
-        if data.empty: return None
+        
+        if data.empty:
+            return None
             
-        # Robust MultiIndex Flattening
+        # VERY ROBUST MultiIndex Flattening for yfinance v0.2.x
         if isinstance(data.columns, pd.MultiIndex):
-            # yf v0.2.x returns (Price, Ticker) or (Ticker, Price)
-            # Find levels that contain 'Close'
+            # If for some reason it's a MultiIndex, we only care about the level that has OHLC
+            # Often it's (Level 0: Price, Level 1: Ticker)
+            # Level 0 usually contains 'Open', 'High', 'Low', 'Close', 'Volume'
+            # We will flatten by taking the level that contains 'Close'
             for i in range(data.columns.nlevels):
                 if 'Close' in data.columns.get_level_values(i):
                     data.columns = data.columns.get_level_values(i)
                     break
         
-        # Ensure standard OHLC columns exist
-        required_cols = ['Open', 'High', 'Low', 'Close']
-        if not all(col in data.columns for col in required_cols):
-            return None
-            
-        # CAST TO NUMERIC IMMEDIATELY
-        for col in required_cols:
+        # Select and reorder columns to ensure we have a clean DataFrame
+        cols_to_keep = ['Open', 'High', 'Low', 'Close', 'Volume']
+        available_cols = [c for c in cols_to_keep if c in data.columns]
+        data = data[available_cols].copy()
+
+        # Ensure numeric and drop any NaNs in price data
+        for col in available_cols:
             data[col] = pd.to_numeric(data[col], errors='coerce')
         
-        data.dropna(subset=required_cols, inplace=True)
+        data.dropna(subset=['Close'], inplace=True)
         return data
-    except Exception:
+    except Exception as e:
         return None
 
 # 3. Strategy Calculation
 def calculate_indicators(df):
-    if df is None: return df
+    if df is None or len(df) == 0: return df
     df = df.copy()
 
-    # Ensure numerical and Drop NaNs in price
-    price_cols = ['Open', 'High', 'Low', 'Close']
-    for c in price_cols:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
-    df.dropna(subset=price_cols, inplace=True)
+    # Double check numerical
+    for c in ['Open', 'High', 'Low', 'Close']:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
     
-    if len(df) < 50: return df
-    
-    # --- Technical Indicators ---
     # RSI
     df['RSI'] = ta.rsi(df['Close'], length=14)
     
     # MACD
     macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
     if macd is not None:
-        # Standardize MACD column names
-        # MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
+        # Avoid column name collisions and handle MultiIndex if ta returns it
+        macd = macd.astype(float)
         m_col = [c for c in macd.columns if 'MACD_' in str(c) and 'h' not in str(c) and 's' not in str(c)]
         s_col = [c for c in macd.columns if 'MACDs_' in str(c)]
         h_col = [c for c in macd.columns if 'MACDh_' in str(c)]
         
-        if m_col: df['MACD'] = macd[m_col[0]]
-        if s_col: df['MACD_Signal'] = macd[s_col[0]]
-        if h_col: df['MACD_Hist'] = macd[h_col[0]]
+        if m_col: df['MACD'] = macd[m_col[0]].values
+        if s_col: df['MACD_Signal'] = macd[s_col[0]].values
+        if h_col: df['MACD_Hist'] = macd[h_col[0]].values
 
     # EMAs
     df['EMA_9'] = ta.ema(df['Close'], length=9)
@@ -118,15 +119,15 @@ def calculate_indicators(df):
     if bb is not None:
         l_col = [c for c in bb.columns if c.startswith('BBL')]
         u_col = [c for c in bb.columns if c.startswith('BBU')]
-        if l_col: df['BB_Lower'] = bb[l_col[0]]
-        if u_col: df['BB_Upper'] = bb[u_col[0]]
+        if l_col: df['BB_Lower'] = bb[l_col[0]].values
+        if u_col: df['BB_Upper'] = bb[u_col[0]].values
 
     return df
 
 def apply_strategy(df, strategy_name):
-    if df is None or len(df) < 20: return df
+    if df is None or len(df) < 5: return df
     
-    df['Signal_Point'] = 0
+    df['Signal_Point'] = 0.0
     
     # 1. Momentum Strategy
     if "Momentum" in strategy_name and 'MACD' in df.columns:
@@ -135,20 +136,19 @@ def apply_strategy(df, strategy_name):
         cross_up = (m.shift(1) <= s.shift(1)) & (m > s)
         cross_down = (m.shift(1) >= s.shift(1)) & (m < s)
         
-        # Trend filter
         ema200 = df['EMA_200'].fillna(method='ffill')
         uptrend = df['Close'] > ema200
         downtrend = df['Close'] < ema200
         
-        df.loc[uptrend & cross_up & (df['RSI'] < 70), 'Signal_Point'] = 1
-        df.loc[downtrend & cross_down & (df['RSI'] > 30), 'Signal_Point'] = -1
+        df.loc[uptrend & cross_up & (df['RSI'] < 70), 'Signal_Point'] = 1.0
+        df.loc[downtrend & cross_down & (df['RSI'] > 30), 'Signal_Point'] = -1.0
         
     # 2. Mean Reversion
     elif "Mean Reversion" in strategy_name and 'BB_Lower' in df.columns:
         buy_cond = (df['Close'] < df['BB_Lower']) & (df['RSI'] < 35)
         sell_cond = (df['Close'] > df['BB_Upper']) & (df['RSI'] > 65)
-        df.loc[buy_cond, 'Signal_Point'] = 1
-        df.loc[sell_cond, 'Signal_Point'] = -1
+        df.loc[buy_cond, 'Signal_Point'] = 1.0
+        df.loc[sell_cond, 'Signal_Point'] = -1.0
         
     # 3. Scalping
     elif "Scalping" in strategy_name and 'EMA_9' in df.columns:
@@ -156,21 +156,19 @@ def apply_strategy(df, strategy_name):
         e21 = df['EMA_21'].fillna(0)
         cross_up = (e9.shift(1) <= e21.shift(1)) & (e9 > e21)
         cross_down = (e9.shift(1) >= e21.shift(1)) & (e9 < e21)
-        df.loc[cross_up, 'Signal_Point'] = 1
-        df.loc[cross_down, 'Signal_Point'] = -1
+        df.loc[cross_up, 'Signal_Point'] = 1.0
+        df.loc[cross_down, 'Signal_Point'] = -1.0
 
     # 4. ORB
     elif "ORB" in strategy_name:
         df['Date_Str'] = df.index.date
         for date, day_data in df.groupby('Date_Str'):
-            # Need enough data for 30m ORB
-            # if 1m, 30 bars. if 5m, 6 bars.
-            needed = 30 # conservative
+            needed = 30 
             if len(day_data) < needed: continue
             
             opening_range = day_data.iloc[:needed]
-            o_high = opening_range['High'].max()
-            o_low = opening_range['Low'].min()
+            o_high = float(opening_range['High'].max())
+            o_low = float(opening_range['Low'].min())
             
             mask_day = df['Date_Str'] == date
             cutoff = day_data.index[needed-1]
@@ -178,8 +176,8 @@ def apply_strategy(df, strategy_name):
             break_up = (df.index > cutoff) & (mask_day) & (df['Close'] > o_high) & (df['Close'].shift(1) <= o_high)
             break_down = (df.index > cutoff) & (mask_day) & (df['Close'] < o_low) & (df['Close'].shift(1) >= o_low)
             
-            df.loc[break_up, 'Signal_Point'] = 1
-            df.loc[break_down, 'Signal_Point'] = -1
+            df.loc[break_up, 'Signal_Point'] = 1.0
+            df.loc[break_down, 'Signal_Point'] = -1.0
             df.loc[mask_day, 'ORB_High'] = o_high
             df.loc[mask_day, 'ORB_Low'] = o_low
             
@@ -567,9 +565,9 @@ if selected_ticker:
         
         # Recent Data Table
         with st.expander("View Recent Data"):
-            # Cast to float to avoid LargeUtf8/Arrow errors in some environments
-            display_df = df.tail(10)[['Open', 'High', 'Low', 'Close', 'RSI', 'Signal_Point']].astype(float)
-            st.dataframe(display_df.style.format("{:.2f}"))
+            # Aggressive conversion to string to avoid LargeUtf8/Arrow errors
+            display_df = df.tail(10)[['Open', 'High', 'Low', 'Close', 'RSI', 'Signal_Point']].copy()
+            st.dataframe(display_df.astype(str))
 
     else:
         st.error(f"No data found for {selected_index_name} ({selected_ticker}).")
