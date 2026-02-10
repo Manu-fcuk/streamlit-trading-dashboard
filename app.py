@@ -140,24 +140,48 @@ def plot_chart(df, ticker_name, strategy_name, timeframe):
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=heights, subplot_titles=titles)
     fig.add_trace(go.Candlestick(x=idx_str, open=df_p['Open'], high=df_p['High'], low=df_p['Low'], close=df_p['Close'], name='Market'), row=1, col=1)
     
-    # Overlays
-    if "Momentum" in strategy_name and 'EMA_200' in df_p.columns:
-        fig.add_trace(go.Scatter(x=idx_str, y=df_p['EMA_200'], name='EMA 200', line=dict(color='blue', width=1.5)), row=1, col=1)
-    elif "Mean Reversion" in strategy_name and 'BB_Upper' in df_p.columns:
-        fig.add_trace(go.Scatter(x=idx_str, y=df_p['BB_Upper'], name='BB Upper', line=dict(color='gray', width=1)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=idx_str, y=df_p['BB_Lower'], name='BB Lower', line=dict(color='gray', width=1)), row=1, col=1)
+    # Overlays - Add EMAs and indicators based on strategy
+    if "Momentum" in strategy_name:
+        if 'EMA_50' in df_p.columns:
+            fig.add_trace(go.Scatter(x=idx_str, y=df_p['EMA_50'], name='EMA 50', line=dict(color='orange', width=1.5)), row=1, col=1)
+        if 'EMA_200' in df_p.columns:
+            fig.add_trace(go.Scatter(x=idx_str, y=df_p['EMA_200'], name='EMA 200', line=dict(color='blue', width=2)), row=1, col=1)
+    elif "Mean Reversion" in strategy_name:
+        if 'BB_Upper' in df_p.columns and 'BB_Lower' in df_p.columns:
+            fig.add_trace(go.Scatter(x=idx_str, y=df_p['BB_Upper'], name='BB Upper', line=dict(color='rgba(173,216,230,0.8)', width=1.5)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=idx_str, y=df_p['BB_Lower'], name='BB Lower', line=dict(color='rgba(173,216,230,0.8)', width=1.5)), row=1, col=1)
+    elif "Scalping" in strategy_name:
+        if 'EMA_9' in df_p.columns:
+            fig.add_trace(go.Scatter(x=idx_str, y=df_p['EMA_9'], name='EMA 9', line=dict(color='green', width=1.5)), row=1, col=1)
+        if 'EMA_21' in df_p.columns:
+            fig.add_trace(go.Scatter(x=idx_str, y=df_p['EMA_21'], name='EMA 21', line=dict(color='red', width=1.5)), row=1, col=1)
+    elif "ORB" in strategy_name:
+        if 'ORB_High' in df_p.columns:
+            fig.add_trace(go.Scatter(x=idx_str, y=df_p['ORB_High'], name='ORB High', line=dict(color='orange', width=1.5, dash='dash')), row=1, col=1)
+        if 'ORB_Low' in df_p.columns:
+            fig.add_trace(go.Scatter(x=idx_str, y=df_p['ORB_Low'], name='ORB Low', line=dict(color='orange', width=1.5, dash='dash')), row=1, col=1)
     
     # Signals
     buys = df_p[df_p['Signal_Point'] == 1.0]; sells = df_p[df_p['Signal_Point'] == -1.0]
-    if not buys.empty: fig.add_trace(go.Scatter(x=buys.index.strftime('%H:%M'), y=buys['Low']*0.9997, mode='markers', marker=dict(symbol='triangle-up', size=15, color='#00ff00'), name='BUY'), row=1, col=1)
-    if not sells.empty: fig.add_trace(go.Scatter(x=sells.index.strftime('%H:%M'), y=sells['High']*1.0003, mode='markers', marker=dict(symbol='triangle-down', size=15, color='#ff0000'), name='SELL'), row=1, col=1)
+    if not buys.empty: 
+        fig.add_trace(go.Scatter(x=buys.index.strftime('%H:%M'), y=buys['Low']*0.9997, mode='markers', marker=dict(symbol='triangle-up', size=15, color='#00ff00'), name='BUY'), row=1, col=1)
+    if not sells.empty: 
+        fig.add_trace(go.Scatter(x=sells.index.strftime('%H:%M'), y=sells['High']*1.0003, mode='markers', marker=dict(symbol='triangle-down', size=15, color='#ff0000'), name='SELL'), row=1, col=1)
 
+    # RSI subplot
     if 'RSI' in df_p.columns:
-        fig.add_trace(go.Scatter(x=idx_str, y=df_p['RSI'], name='RSI', line=dict(color='purple')), row=2, col=1)
+        fig.add_trace(go.Scatter(x=idx_str, y=df_p['RSI'], name='RSI', line=dict(color='purple', width=2)), row=2, col=1)
+        fig.add_hline(y=70, line=dict(color='red', width=1, dash='dash'), row=2, col=1)
+        fig.add_hline(y=30, line=dict(color='green', width=1, dash='dash'), row=2, col=1)
         fig.update_yaxes(range=[0, 100], row=2, col=1)
+    
+    # MACD subplot
     if rows == 3 and 'MACD' in df_p.columns:
-        fig.add_trace(go.Bar(x=idx_str, y=df_p['MACD_Hist'], name='Hist'), row=3, col=1)
-        fig.add_trace(go.Scatter(x=idx_str, y=df_p['MACD'], name='MACD'), row=3, col=1)
+        if 'MACD_Hist' in df_p.columns:
+            fig.add_trace(go.Bar(x=idx_str, y=df_p['MACD_Hist'], name='Hist', marker_color='gray'), row=3, col=1)
+        fig.add_trace(go.Scatter(x=idx_str, y=df_p['MACD'], name='MACD', line=dict(color='blue', width=1.5)), row=3, col=1)
+        if 'MACD_Signal' in df_p.columns:
+            fig.add_trace(go.Scatter(x=idx_str, y=df_p['MACD_Signal'], name='Signal', line=dict(color='orange', width=1.5)), row=3, col=1)
     
     fig.update_layout(height=800, xaxis_rangeslider_visible=False, template="plotly_dark", showlegend=False)
     fig.update_xaxes(type='category')
