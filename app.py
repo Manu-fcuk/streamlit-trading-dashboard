@@ -104,7 +104,7 @@ def apply_strategy(df, strategy_name):
         cross_up = (m.shift(1) <= s.shift(1)) & (m > s)
         cross_down = (m.shift(1) >= s.shift(1)) & (m < s)
         if 'EMA_200' in df.columns:
-            ema200 = df['EMA_200'].fillna(method='ffill')
+            ema200 = df['EMA_200'].ffill()
             df.loc[(df['Close'] > ema200) & cross_up & (df['RSI'].fillna(50) < 70), 'Signal_Point'] = 1.0
             df.loc[(df['Close'] < ema200) & cross_down & (df['RSI'].fillna(50) > 30), 'Signal_Point'] = -1.0
     elif "Mean Reversion" in strategy_name and 'BB_Lower' in df.columns:

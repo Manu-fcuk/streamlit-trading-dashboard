@@ -1,8 +1,5 @@
-requests
-pandas
-pandas_ta
 streamlit
 yfinance
+pandas-ta
 plotly
 altair<5
-numpy
