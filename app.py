@@ -350,12 +350,16 @@ def apply_strategy(df, strategy_name):
     if df is None or len(df) < 50: return df
     
     df['Signal_Point'] = 0
-    df = df.fillna(0) # Safety
     
     # 1. Momentum Strategy (Original)
     if "Momentum" in strategy_name:
-        macd_cross_up = (df['MACD'].shift(1) <= df['MACD_Signal'].shift(1)) & (df['MACD'] > df['MACD_Signal'])
-        macd_cross_down = (df['MACD'].shift(1) >= df['MACD_Signal'].shift(1)) & (df['MACD'] < df['MACD_Signal'])
+        # Fill only indicators for cross logic
+        macd = df['MACD'].fillna(0)
+        signal = df['MACD_Signal'].fillna(0)
+        
+        macd_cross_up = (macd.shift(1) <= signal.shift(1)) & (macd > signal)
+        macd_cross_down = (macd.shift(1) >= signal.shift(1)) & (macd < signal)
+        
         uptrend = df['Close'] > df['EMA_200']
         downtrend = df['Close'] < df['EMA_200']
         
@@ -364,74 +368,43 @@ def apply_strategy(df, strategy_name):
         
     # 2. Mean Reversion (Bollinger)
     elif "Mean Reversion" in strategy_name:
-        buy_cond = (df['Close'] < df['BB_Lower']) & (df['RSI'] < 30)
-        sell_cond = (df['Close'] > df['BB_Upper']) & (df['RSI'] > 70)
-        df.loc[buy_cond, 'Signal_Point'] = 1
-        df.loc[sell_cond, 'Signal_Point'] = -1
+        if 'BB_Lower' in df.columns and 'BB_Upper' in df.columns:
+            buy_cond = (df['Close'] < df['BB_Lower']) & (df['RSI'] < 30)
+            sell_cond = (df['Close'] > df['BB_Upper']) & (df['RSI'] > 70)
+            df.loc[buy_cond, 'Signal_Point'] = 1
+            df.loc[sell_cond, 'Signal_Point'] = -1
         
     # 3. Scalping (EMA Cross)
     elif "Scalping" in strategy_name:
-        cross_up = (df['EMA_9'].shift(1) <= df['EMA_21'].shift(1)) & (df['EMA_9'] > df['EMA_21'])
-        cross_down = (df['EMA_9'].shift(1) >= df['EMA_21'].shift(1)) & (df['EMA_9'] < df['EMA_21'])
+        e9 = df['EMA_9'].fillna(0)
+        e21 = df['EMA_21'].fillna(0)
+        cross_up = (e9.shift(1) <= e21.shift(1)) & (e9 > e21)
+        cross_down = (e9.shift(1) >= e21.shift(1)) & (e9 < e21)
         df.loc[cross_up, 'Signal_Point'] = 1
         df.loc[cross_down, 'Signal_Point'] = -1
 
     # 4. ORB (Opening Range Breakout)
     elif "ORB" in strategy_name:
-        # Define Market Open Time (User's Local Time approx or Exchange Time)
-        # Note: yfinance returns UTC or Exchange Local.
-        # It's safest to assume US Market Open is 09:30 ET / 14:30 UTC (std) or 13:30 UTC (dst).
-        # EU Market Open is 09:00 CET / 08:00 UTC.
-        # This implementation simplifies by looking for the FIRST candles of the day in the dataframe.
-        
         df['Date_Str'] = df.index.date
-        
-        # We need at least intraday data (1m-60m)
         if len(df) > 0:
-            # Group by day
             for date, day_data in df.groupby('Date_Str'):
                 if len(day_data) < 30: continue
-                
-                # Define Opening Range (First 30 mins)
-                # Assuming index is sorted
-                orb_start_idx = 0
-                orb_end_idx = 30 # roughly 30 bars if 1m, 6 bars if 5m
-                
-                # Adjust for timeframe
-                # If 5m, 30 mins = 6 bars. If 15m, 30 mins = 2 bars.
-                # Simplification: Just take first N bars of day.
-                
-                opening_range = day_data.iloc[:30] # Taking first 30 bars (if 1m)
-                
+                opening_range = day_data.iloc[:30] 
                 orb_high = opening_range['High'].max()
                 orb_low = opening_range['Low'].min()
-                
-                # We need to mark signals occurring AFTER the opening range
-                # Indices in global df corresponding to day_data, skipping first 30
-                
-                # We can vectorise this better but loop is robust for now with limited history
                 mask_day = df['Date_Str'] == date
                 
-                # Identify breakout candles (Close > High or Close < Low)
-                # Ensure we are past the ORB period
-                # Find the timestamp of the 30th bar
                 if len(day_data) > 30:
                     cutoff_time = day_data.index[29]
-                    
-                    # Breakout Up
                     breakout_up = (df.index > cutoff_time) & (mask_day) & \
                                   (df['Close'] > orb_high) & \
-                                  (df['Close'].shift(1) <= orb_high) # Crossover check
-                    
-                    # Breakout Down
+                                  (df['Close'].shift(1) <= orb_high)
                     breakout_down = (df.index > cutoff_time) & (mask_day) & \
                                     (df['Close'] < orb_low) & \
                                     (df['Close'].shift(1) >= orb_low)
                     
                     df.loc[breakout_up, 'Signal_Point'] = 1
                     df.loc[breakout_down, 'Signal_Point'] = -1
-                    
-                    # Store ORB levels for plotting (optional, hacky way to attach to df)
                     df.loc[mask_day, 'ORB_High'] = orb_high
                     df.loc[mask_day, 'ORB_Low'] = orb_low
         
